@@ -34,12 +34,14 @@
     "@types/mime-types": "^2.1.4",
     "@types/node": "^20.0.0",
     "astro": "^5.1.3",
-    "bun-types": "latest",
     "h3": "^1.13.0",
     "typescript": "^5.2.2"
   },
   "dependencies": {
     "@changesets/cli": "^2.27.11",
     "mime-types": "^2.1.35"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

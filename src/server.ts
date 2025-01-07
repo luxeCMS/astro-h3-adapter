@@ -1,4 +1,4 @@
-import { createApp, defineEventHandler, toNodeListener, createError } from "h3";
+import { createApp, defineEventHandler, toNodeListener, H3Event } from "h3";
 import { NodeApp } from "astro/app/node";
 import type { SSRManifest } from "astro";
 import { fileURLToPath } from "node:url";
@@ -35,7 +35,7 @@ export function createExports(
 
   async function serveStaticFile(
     filePath: string,
-    event: any,
+    event: H3Event,
     cache = false,
   ): Promise<Buffer | null> {
     try {
@@ -53,49 +53,49 @@ export function createExports(
         );
       }
 
-      const ifModifiedSince = event.node.req.headers["if-modified-since"];
-      if (ifModifiedSince && new Date(ifModifiedSince) >= stats.mtime) {
-        event.node.res.statusCode = 304;
-        return null;
-      }
-
       return await readFile(filePath);
     } catch {
       return null;
     }
   }
 
-  async function handleRequest(req: Request, event: any, routeData: any) {
-    const response = await app.render(req, {
-      routeData,
-      locals: event.context,
-      addCookieHeader: true,
-    });
+  let clientRoot: string;
+  if (options.client) {
+    clientRoot = fileURLToPath(new URL(".", new URL(options.client)));
+  }
 
-    if (!response.body) return null;
+  async function tryStaticFile(
+    path: string,
+    event: H3Event,
+  ): Promise<Buffer | null> {
+    if (!clientRoot) return null;
+    const filePath = join(clientRoot, path);
 
-    event.node.res.statusCode = response.status;
-    response.headers.forEach((value, key) => {
-      event.node.res.setHeader(key, value);
-    });
+    // Try exact path
+    let content = await serveStaticFile(filePath, event);
+    if (content) return content;
 
-    return Buffer.from(await response.arrayBuffer());
+    // Try with /index.html
+    if (!path.endsWith("/")) {
+      content = await serveStaticFile(filePath + "/index.html", event);
+      if (content) return content;
+    }
+
+    // Try path/index.html
+    content = await serveStaticFile(join(filePath, "index.html"), event);
+    if (content) return content;
+
+    return null;
   }
 
   if (options.client) {
-    const clientRoot = fileURLToPath(new URL(".", new URL(options.client)));
-
     h3App.use(
       "*",
       defineEventHandler(async (event) => {
         const url = event.node.req.url!;
+        const method = event.node.req.method!;
 
-        // Early return for non-GET requests that aren't Astro routes
-        if (event.node.req.method !== "GET" && !url.includes("/_astro/")) {
-          return;
-        }
-
-        // Handle _astro assets
+        // Handle _astro assets first
         if (url.startsWith("/_astro/")) {
           const assetPath = decodeURIComponent(url.slice(7));
           const filePath = join(clientRoot, "_astro", assetPath);
@@ -103,33 +103,49 @@ export function createExports(
           if (content) return content;
         }
 
-        // Handle regular static files
-        if (event.node.req.method === "GET") {
-          const path = decodeURIComponent(url);
-          const filePath = join(clientRoot, path);
-          const content = await serveStaticFile(filePath, event);
-          if (content) return content;
-        }
-
-        // Handle Astro routes
+        // Create request for route matching
         const req = new Request(`http://${event.node.req.headers.host}${url}`, {
           method: event.node.req.method,
           headers: event.node.req.headers as any,
         });
 
-        try {
-          const routeData = app.match(req);
-          return routeData
-            ? await als.run(req.url, () => handleRequest(req, event, routeData))
-            : await handleRequest(req, event, null);
-        } catch (err) {
-          logger.error(`Error rendering ${req.url}`);
-          console.error(err);
-          throw createError({
-            statusCode: 500,
-            statusMessage: "Internal Server Error",
+        // Try to match route first
+        const routeData = app.match(req);
+
+        if (routeData || method !== "GET") {
+          return await als.run(req.url, async () => {
+            const response = await app.render(req, {
+              routeData,
+              locals: event.context,
+              addCookieHeader: true,
+            });
+
+            if (!response.body) return null;
+
+            // Copy status and headers
+            event.node.res.statusCode = response.status;
+            response.headers.forEach((value, key) => {
+              event.node.res.setHeader(key, value);
+            });
+
+            return Buffer.from(await response.arrayBuffer());
           });
         }
+
+        // If no route match and it's a GET request, try static files
+        if (method === "GET") {
+          const path = decodeURIComponent(url);
+          const content = await tryStaticFile(path, event);
+          if (content) return content;
+        }
+
+        // If nothing matched, let Astro handle 404
+        const notFoundResponse = await app.render(req);
+        event.node.res.statusCode = notFoundResponse.status;
+        notFoundResponse.headers.forEach((value, key) => {
+          event.node.res.setHeader(key, value);
+        });
+        return Buffer.from(await notFoundResponse.arrayBuffer());
       }),
     );
   }
@@ -141,6 +157,7 @@ export function createExports(
       ? parseInt(process.env.PORT)
       : options.port ?? 3000;
     const host = process.env.HOST ?? options.host ?? "localhost";
+
     const server = createServer(handler);
     let isClosing = false;
 

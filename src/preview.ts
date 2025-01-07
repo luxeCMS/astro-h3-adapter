@@ -1,28 +1,30 @@
 import { fileURLToPath } from "node:url";
 import type { CreatePreviewServer } from "astro";
 import { AstroError } from "astro/errors";
-import { createExports } from "./server.js";
+import type { createExports } from "./server.js";
 
-type ServerModule = {
-  handler: ReturnType<typeof createExports>["handler"];
-  startServer: ReturnType<typeof createExports>["startServer"];
-  options: ReturnType<typeof createExports>["options"];
-};
+type ServerModule = ReturnType<typeof createExports>;
+type MaybeServerModule = Partial<ServerModule>;
 
 const createPreviewServer: CreatePreviewServer = async (preview) => {
-  let ssrModule: Partial<ServerModule>;
+  let ssrHandler: ServerModule["handler"];
+  let startServer: ServerModule["startServer"];
 
   try {
     process.env.ASTRO_NODE_AUTOSTART = "disabled";
-
-    ssrModule = await import(preview.serverEntrypoint.toString());
+    const ssrModule: MaybeServerModule = await import(
+      preview.serverEntrypoint.toString()
+    );
 
     if (
-      typeof ssrModule?.handler !== "function" ||
-      typeof ssrModule?.startServer !== "function"
+      typeof ssrModule?.handler === "function" &&
+      typeof ssrModule?.startServer === "function"
     ) {
+      ssrHandler = ssrModule.handler;
+      startServer = ssrModule.startServer;
+    } else {
       throw new AstroError(
-        "The server entrypoint is missing required exports (handler or startServer). Did you remove the adapter exports?",
+        "The server entrypoint doesn't have required exports (handler and startServer). Are you sure this is the right file?",
       );
     }
   } catch (err) {
@@ -30,7 +32,7 @@ const createPreviewServer: CreatePreviewServer = async (preview) => {
       throw new AstroError(
         `The server entrypoint ${fileURLToPath(
           preview.serverEntrypoint,
-        )} does not exist. Have you run a build?`,
+        )} does not exist. Have you run a build yet?`,
       );
     }
     throw err;
@@ -42,8 +44,9 @@ const createPreviewServer: CreatePreviewServer = async (preview) => {
     mode: "preview" as const,
   };
 
-  const server = ssrModule.startServer(options);
+  const server = startServer(options);
 
+  // If user specified custom headers append a listener
   if (preview.headers && server.app) {
     server.app.use(async (event) => {
       const response = event.node.res;
@@ -61,10 +64,16 @@ const createPreviewServer: CreatePreviewServer = async (preview) => {
     `Preview server listening on http://${options.host}:${options.port}`,
   );
 
+  await new Promise<void>((resolve, reject) => {
+    server.server.once("listening", resolve);
+    server.server.once("error", reject);
+  });
+
   return {
     host: options.host,
     port: options.port,
     server: server.server,
+    handler: ssrHandler,
     closed() {
       return server.closed();
     },
