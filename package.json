@@ -1,6 +1,6 @@
 {
   "name": "astro-h3-adapter",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "type": "module",
   "description": "H3 adapter for Astro",
   "author": "RATIU5",
