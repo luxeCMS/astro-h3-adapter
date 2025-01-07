@@ -39,7 +39,6 @@
     "typescript": "^5.2.2"
   },
   "dependencies": {
-    "autocannon": "8.0.0",
     "mime-types": "^2.1.35"
   }
 }
