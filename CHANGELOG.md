@@ -1,5 +1,11 @@
 # astro-h3-adapter
 
+## 0.3.0
+
+### Minor Changes
+
+- c3787f0: patch: 404 handling now works
+
 ## 0.2.0
 
 ### Minor Changes
