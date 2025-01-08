@@ -1,27 +1,90 @@
-import { createApp, defineEventHandler, toNodeListener, H3Event } from "h3";
+import {
+  createApp,
+  defineEventHandler,
+  toNodeListener,
+  createError,
+  H3Error,
+} from "h3";
 import { NodeApp } from "astro/app/node";
 import type { SSRManifest } from "astro";
 import { fileURLToPath } from "node:url";
-import { join, extname } from "node:path";
+import { join } from "node:path";
 import type { AdapterOptions } from "./types.js";
 import { setGetEnv } from "astro/env/setup";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import mime from "mime-types";
+import { Readable } from "node:stream";
 
 setGetEnv((key) => process.env[key]);
 
-const mimeTypeCache = new Map<string, string>();
+async function writeWebResponse(res: any, webResponse: Response) {
+  const { status, headers, body } = webResponse;
 
-function getMimeType(filePath: string): string {
-  const ext = extname(filePath);
-  let mimeType = mimeTypeCache.get(ext);
-  if (!mimeType) {
-    mimeType = mime.lookup(ext) || "application/octet-stream";
-    mimeTypeCache.set(ext, mimeType);
+  // Set status code
+  res.statusCode = status;
+
+  // Get content type from response headers
+  let contentType = "";
+  for (const [name, value] of headers) {
+    const headerName = name.toLowerCase();
+    if (headerName === "content-type") {
+      contentType = value;
+    }
+    res.setHeader(name, value);
   }
-  return mimeType;
+
+  // If no content type is set, try to infer it
+  if (!contentType) {
+    contentType = "text/plain";
+    res.setHeader("Content-Type", contentType);
+  }
+
+  if (!body) {
+    res.end();
+    return;
+  }
+
+  if (body instanceof Readable) {
+    body.pipe(res);
+    return;
+  }
+
+  // ReadableStream from web standard
+  const bodyAsReadable = body as ReadableStream;
+  const reader = bodyAsReadable.getReader();
+  const chunks: Uint8Array[] = [];
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+
+    const fullBuffer = Buffer.concat(chunks);
+
+    // Handle different content types
+    if (contentType.includes("application/json")) {
+      try {
+        const jsonString = fullBuffer.toString("utf-8");
+        const jsonData = JSON.parse(jsonString);
+        res.end(JSON.stringify(jsonData, null, 2));
+      } catch {
+        res.end(fullBuffer);
+      }
+    } else if (contentType.startsWith("text/")) {
+      res.end(fullBuffer.toString("utf-8"));
+    } else {
+      res.end(fullBuffer);
+    }
+  } catch (error) {
+    console.error("Error reading from body:", error);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 export function createExports(
@@ -35,14 +98,14 @@ export function createExports(
 
   async function serveStaticFile(
     filePath: string,
-    event: H3Event,
+    event: any,
     cache = false,
-  ): Promise<Buffer | null> {
+  ): Promise<boolean> {
     try {
       const stats = await stat(filePath);
-      if (!stats.isFile()) return null;
+      if (!stats.isFile()) return false;
 
-      const contentType = getMimeType(filePath);
+      const contentType = mime.lookup(filePath) || "application/octet-stream";
       event.node.res.setHeader("Content-Type", contentType);
       event.node.res.setHeader("Last-Modified", stats.mtime.toUTCString());
 
@@ -53,99 +116,93 @@ export function createExports(
         );
       }
 
-      return await readFile(filePath);
+      const ifModifiedSince = event.node.req.headers["if-modified-since"];
+      if (ifModifiedSince && new Date(ifModifiedSince) >= stats.mtime) {
+        event.node.res.statusCode = 304;
+        event.node.res.end();
+        return true;
+      }
+
+      const content = await readFile(filePath);
+      event.node.res.end(content);
+      return true;
     } catch {
-      return null;
+      return false;
     }
   }
 
-  let clientRoot: string;
-  if (options.client) {
-    clientRoot = fileURLToPath(new URL(".", new URL(options.client)));
-  }
+  async function handleRequest(req: Request, event: any, routeData: any) {
+    try {
+      const response = await app.render(req, {
+        routeData,
+        locals: event.context,
+        addCookieHeader: true,
+      });
 
-  async function tryStaticFile(
-    path: string,
-    event: H3Event,
-  ): Promise<Buffer | null> {
-    if (!clientRoot) return null;
-    const filePath = join(clientRoot, path);
-
-    // Try exact path
-    let content = await serveStaticFile(filePath, event);
-    if (content) return content;
-
-    // Try with /index.html
-    if (!path.endsWith("/")) {
-      content = await serveStaticFile(filePath + "/index.html", event);
-      if (content) return content;
+      await writeWebResponse(event.node.res, response);
+    } catch (error) {
+      logger.error(`Error rendering ${req.url}`);
+      console.error(error);
+      throw createError({
+        statusCode: 500,
+        statusMessage: "Internal Server Error",
+      });
     }
-
-    // Try path/index.html
-    content = await serveStaticFile(join(filePath, "index.html"), event);
-    if (content) return content;
-
-    return null;
   }
 
   if (options.client) {
+    const clientRoot = fileURLToPath(new URL(".", new URL(options.client)));
+
     h3App.use(
       "*",
       defineEventHandler(async (event) => {
         const url = event.node.req.url!;
-        const method = event.node.req.method!;
 
         // Handle _astro assets first
         if (url.startsWith("/_astro/")) {
           const assetPath = decodeURIComponent(url.slice(7));
           const filePath = join(clientRoot, "_astro", assetPath);
-          const content = await serveStaticFile(filePath, event, true);
-          if (content) return content;
+          if (await serveStaticFile(filePath, event, true)) {
+            return;
+          }
         }
 
-        // Create request for route matching
+        // Handle regular static files for GET requests
+        if (event.node.req.method === "GET") {
+          const path = decodeURIComponent(url);
+          const filePath = join(clientRoot, path);
+          if (await serveStaticFile(filePath, event)) {
+            return;
+          }
+        }
+
+        // If we get here, it's not a static file, so handle it as a route
         const req = new Request(`http://${event.node.req.headers.host}${url}`, {
           method: event.node.req.method,
           headers: event.node.req.headers as any,
         });
 
-        // Try to match route first
-        const routeData = app.match(req);
+        try {
+          const routeData = app.match(req);
+          if (routeData) {
+            await als.run(req.url, () => handleRequest(req, event, routeData));
+            return;
+          }
 
-        if (routeData || method !== "GET") {
-          return await als.run(req.url, async () => {
-            const response = await app.render(req, {
-              routeData,
-              locals: event.context,
-              addCookieHeader: true,
-            });
-
-            if (!response.body) return null;
-
-            // Copy status and headers
-            event.node.res.statusCode = response.status;
-            response.headers.forEach((value, key) => {
-              event.node.res.setHeader(key, value);
-            });
-
-            return Buffer.from(await response.arrayBuffer());
+          // No route matched, try to render 404
+          const response = await app.render(req);
+          await writeWebResponse(event.node.res, response);
+        } catch (err) {
+          if (err instanceof H3Error && err?.statusCode === 404) {
+            throw err;
+          }
+          logger.error(`Error rendering ${req.url}`);
+          console.error(err);
+          throw createError({
+            statusCode: 500,
+            statusMessage: "Internal Server Error",
           });
         }
-
-        // If no route match and it's a GET request, try static files
-        if (method === "GET") {
-          const path = decodeURIComponent(url);
-          const content = await tryStaticFile(path, event);
-          if (content) return content;
-        }
-
-        // If nothing matched, let Astro handle 404
-        const notFoundResponse = await app.render(req);
-        event.node.res.statusCode = notFoundResponse.status;
-        notFoundResponse.headers.forEach((value, key) => {
-          event.node.res.setHeader(key, value);
-        });
-        return Buffer.from(await notFoundResponse.arrayBuffer());
       }),
     );
   }
