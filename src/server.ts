@@ -157,7 +157,6 @@ export function createExports(
       ? parseInt(process.env.PORT)
       : options.port ?? 3000;
     const host = process.env.HOST ?? options.host ?? "localhost";
-
     const server = createServer(handler);
     let isClosing = false;
 
@@ -189,4 +188,16 @@ export function createExports(
   }
 
   return { handler, startServer, options };
+}
+
+export function start(manifest: SSRManifest, options: AdapterOptions = {}) {
+  if (
+    options.mode !== "standalone" ||
+    process.env.ASTRO_NODE_AUTOSTART === "disabled"
+  ) {
+    return;
+  }
+
+  const { startServer } = createExports(manifest, options);
+  startServer(options);
 }

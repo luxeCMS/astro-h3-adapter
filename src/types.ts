@@ -39,6 +39,7 @@ export interface AdapterOptions extends UserOptions {
   server?: string;
   assets?: string;
   trailingSlash?: SSRManifest["trailingSlash"];
+  mode?: "standalone" | "preview"; // Make mode required in AdapterOptions
 }
 
 export interface AstroH3Server {

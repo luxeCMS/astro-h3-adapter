@@ -14,7 +14,7 @@ function getAdapter(options: Options): AstroAdapter {
     name: "astro-h3-adapter",
     serverEntrypoint: "astro-h3-adapter/server.js",
     previewEntrypoint: "astro-h3-adapter/preview.js",
-    exports: ["handler", "startServer"],
+    exports: ["handler", "startServer", "start"],
     args: options,
     adapterFeatures: {
       edgeMiddleware: true,
@@ -58,6 +58,7 @@ export default function createIntegration(
       "astro:config:done": ({ setAdapter, config }) => {
         _options = {
           ...userOptions,
+          mode: userOptions.mode ?? "standalone",
           client: config.build.client.toString(),
           server: config.build.server.toString(),
           assets: config.build.assets,
